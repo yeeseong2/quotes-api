@@ -1,0 +1,166 @@
+name: tmp-riot-fetch
+
+on:
+  push:
+    branches:
+      - tmp-riot-research-20260710
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+        with:
+          ref: tmp-riot-research-20260710
+          fetch-depth: 0
+
+      - name: Fetch static Riot resources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p tmp-riot-output/static tmp-riot-output/rendered tmp-riot-output/network
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+          fetch() {
+            name="$1"; url="$2"
+            curl -L --compressed --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 -A "$UA" -D "tmp-riot-output/static/${name}.headers.txt" -o "tmp-riot-output/static/${name}.body" "$url" || true
+            printf '%s\n' "$url" > "tmp-riot-output/static/${name}.url.txt"
+          }
+          fetch sitemap_index 'https://support.riotgames.com/sitemap_index.xml'
+          fetch sitemap_ko 'https://support.riotgames.com/sitemaps/ko-kr/sitemap.xml'
+          fetch sitemap_en 'https://support.riotgames.com/sitemaps/en-us/sitemap.xml'
+          fetch ko_val 'https://support.riotgames.com/ko-kr/valorant/performance/error-codes-and-solutions-in-valorant'
+          fetch en_val 'https://support.riotgames.com/en-us/valorant/performance/error-codes-and-solutions-in-valorant'
+          fetch ko_van 'https://support.riotgames.com/ko-kr/riot/performance/vanguard-error-codes'
+          fetch en_van 'https://support.riotgames.com/en-us/riot/performance/vanguard-error-codes'
+          fetch legacy_val_en_api 'https://support-valorant.riotgames.com/api/v2/help_center/en-us/articles/360045619633.json'
+          fetch legacy_val_ko_api 'https://support-valorant.riotgames.com/api/v2/help_center/ko/articles/360045619633.json'
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          for locale in ('ko','en'):
+              p = Path(f'tmp-riot-output/static/sitemap_{locale}.body')
+              text = p.read_text('utf-8', errors='replace') if p.exists() else ''
+              urls = re.findall(r'<loc>(.*?)</loc>', text, flags=re.I|re.S)
+              terms = re.compile(r'(valorant|vanguard|error|van-|secure-boot|secureboot|tpm|restriction|incompatible|launch|connection|system-restart|restart|required|windows-11|virtual|bios|uefi|exploit-protection)', re.I)
+              matches = sorted({u.strip() for u in urls if terms.search(u)})
+              Path(f'tmp-riot-output/static/sitemap_{locale}_matches.txt').write_text('\n'.join(matches)+'\n', encoding='utf-8')
+          PY
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright Chromium
+        shell: bash
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.52.0 >/dev/null
+          npx playwright install --with-deps chromium
+
+      - name: Render official Riot pages and capture network responses
+        shell: bash
+        run: |
+          cat > /tmp/riot-render.js <<'NODE'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+
+          const targets = {
+            ko_val: 'https://support.riotgames.com/ko-kr/valorant/performance/error-codes-and-solutions-in-valorant',
+            en_val: 'https://support.riotgames.com/en-us/valorant/performance/error-codes-and-solutions-in-valorant',
+            ko_van: 'https://support.riotgames.com/ko-kr/riot/performance/vanguard-error-codes',
+            en_van: 'https://support.riotgames.com/en-us/riot/performance/vanguard-error-codes',
+            ko_val_search: 'https://support.riotgames.com/ko-kr/valorant/search?query=%EC%98%A4%EB%A5%98%20%EC%BD%94%EB%93%9C',
+            en_val_search: 'https://support.riotgames.com/en-us/valorant/search?query=error%20codes',
+            ko_riot_search: 'https://support.riotgames.com/ko-kr/riot/search?query=%EB%B1%85%EA%B0%80%EB%93%9C%20%EC%98%A4%EB%A5%98',
+            en_riot_search: 'https://support.riotgames.com/en-us/riot/search?query=vanguard%20error'
+          };
+
+          const outDir = 'tmp-riot-output/rendered';
+          const netDir = 'tmp-riot-output/network';
+          fs.mkdirSync(outDir, { recursive: true });
+          fs.mkdirSync(netDir, { recursive: true });
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            for (const [name, url] of Object.entries(targets)) {
+              const context = await browser.newContext({
+                locale: name.startsWith('ko_') ? 'ko-KR' : 'en-US',
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+              });
+              const page = await context.newPage();
+              const network = [];
+              let responseIndex = 0;
+              page.on('response', async (response) => {
+                const rurl = response.url();
+                const headers = response.headers();
+                const ct = (headers['content-type'] || '').toLowerCase();
+                const item = { url: rurl, status: response.status(), contentType: ct, headers };
+                network.push(item);
+                if ((ct.includes('json') || /api|graphql|article|content|search|sspd|playersupport/i.test(rurl)) && response.status() < 500) {
+                  try {
+                    const body = await response.body();
+                    if (body.length <= 8_000_000) {
+                      const hash = crypto.createHash('sha1').update(rurl).digest('hex').slice(0, 12);
+                      const ext = ct.includes('json') ? 'json' : 'txt';
+                      const filename = `${name}-${String(responseIndex++).padStart(3,'0')}-${hash}.${ext}`;
+                      fs.writeFileSync(path.join(netDir, filename), body);
+                      item.savedAs = filename;
+                    }
+                  } catch (e) {
+                    item.bodyError = String(e);
+                  }
+                }
+              });
+
+              let gotoError = null;
+              try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+                await page.waitForTimeout(20000);
+                for (const label of ['Accept', 'Accept All', '동의', '모두 동의']) {
+                  try {
+                    const b = page.getByRole('button', { name: label, exact: true });
+                    if (await b.count()) { await b.first().click({ timeout: 2000 }); await page.waitForTimeout(2000); break; }
+                  } catch (_) {}
+                }
+                await page.waitForTimeout(5000);
+              } catch (e) {
+                gotoError = String(e);
+              }
+
+              const finalUrl = page.url();
+              const title = await page.title().catch(() => '');
+              const text = await page.locator('body').innerText({ timeout: 10000 }).catch(e => `BODY_TEXT_ERROR: ${e}`);
+              const html = await page.content().catch(e => `PAGE_CONTENT_ERROR: ${e}`);
+              const resources = await page.evaluate(() => performance.getEntriesByType('resource').map(r => ({name:r.name, initiatorType:r.initiatorType, duration:r.duration, transferSize:r.transferSize}))).catch(() => []);
+              fs.writeFileSync(path.join(outDir, `${name}.txt`), `REQUESTED_URL: ${url}\nFINAL_URL: ${finalUrl}\nTITLE: ${title}\nGOTO_ERROR: ${gotoError || ''}\n\n${text}`, 'utf8');
+              fs.writeFileSync(path.join(outDir, `${name}.html`), html, 'utf8');
+              fs.writeFileSync(path.join(outDir, `${name}.network.json`), JSON.stringify(network, null, 2), 'utf8');
+              fs.writeFileSync(path.join(outDir, `${name}.resources.json`), JSON.stringify(resources, null, 2), 'utf8');
+              await context.close();
+            }
+            await browser.close();
+          })().catch(err => { console.error(err); process.exitCode = 1; });
+          NODE
+          node /tmp/riot-render.js
+
+      - name: Commit fetched research output
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tmp-riot-output
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add temporary Riot support fetch output [skip ci]'
+            git push origin HEAD:tmp-riot-research-20260710
+          fi
